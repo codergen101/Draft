@@ -414,25 +414,25 @@ def get_processes_by_incident_time_list(inc_time_list, threshold_window=5, thres
     :param threshold_window: amount of time in seconds to search for the process in the connections log (Default is 5s)
     :param threshold_unit: the unit used to calculate the window. Can be "second", "minute", or "hour".
                            Default is seconds
-    :return: List of possible processes
+    :return: List of possible processes of each of the given incident times in inc_time_list
     """
 
-    inc_time_proc = [[elem[0], []] for elem in inc_time_list]
+    inc_proc_total = [[elem[0], []] for elem in inc_time_list]
 
     for index in range(len(inc_time_list)):
         inc = inc_time_list[index]
         for inc_time in inc[1]:
-            proc_res = get_processes_by_scan_incident_time(inc_time_proc[index][0],
+            proc_res = get_processes_by_scan_incident_time(inc_proc_total[index][0],
                                                            inc_time[0].strftime("%Y-%m-%dT%H:%M:%S"),
                                                            threshold_window, threshold_unit)
-            inc_time_proc[index][1].append(proc_res)
+            inc_proc_total[index][1].append(proc_res)
 
-    return inc_time_proc
+    return inc_proc_total
 
 
 def get_processes_by_scan_obj(scan_obj, threshold_window=5, threshold_unit="second"):
     """
-    Retrieves the processes responsible for initializing the network scan incidents of teh given scan object.
+    Retrieves the processes responsible for initializing the network scan incidents of the given scan object.
 
     :param scan_obj: JSON format of scan object from mongo
     :param threshold_window: amount of time in seconds to search for the process in the connections log (Default is 5s)
@@ -513,6 +513,185 @@ def get_process_info(process_id, source_ip):
 
     return searchq.execute()
 
+
+def get_n_incidents_by_ip(ip_addr, scan_objs, n=10, by_ip=False):
+    """
+    Retrieves the ids of the min(n, len(incident_obj["incident_ids"])) of the incident object with the
+    given IP address.
+    scan_objs is a list of dicts of scan objects as queried from mongo.
+
+    :param ip_addr: The IP address of the scan object to look for. pass None if by_ip is False.
+    :param scan_objs: List containing scan objects as retrieved from mongo.
+    :param n: number of incident ids to return for the scan object. Default is 10.
+    :param by_ip: When True, will return the incident ids only for the objects with the given IP.
+                  When False, will return the incident ids for all the objects in the given list.
+    :return: Incident IDs of min(n, len(scan_obj["incident_ids"]))
+    """
+
+    ip_inc = []
+
+    for elem in scan_objs:
+        if by_ip:
+            if elem["IP"] == ip_addr:
+                return tuple((elem["IP"], elem["incident_ids"][:min(n, len(elem["incident_ids"]))]))
+        else:
+            ip_inc.append((elem["IP"], elem["incident_ids"][:min(n, len(elem["incident_ids"]))]))
+
+    return ip_inc
+
+
+def get_n_incidents_by_ip_list(ip_list, scan_objs, n=10):
+    """
+    Retrieves the ids of the min(n, len(incident_obj["incident_ids"])) of the incident object which
+    have IP addresses from the given list.
+    scan_objs is a list of dicts of scan objects as queried from mongo.
+
+    :param ip_list: List of IP addresses to search by
+    :param scan_objs: List containing scan objects as retrieved from mongo.
+    :param n: number of incident ids to return for the scan object. Default is 10.
+    :return: List of tuples (IP, incident_ids_list) for each IP in the given list
+    """
+
+    ip_inc = []
+
+    for ip in ip_list:
+        ip_inc.append(get_n_incidents_by_ip(ip, scan_objs, n, True))
+
+    return ip_inc
+
+
+def get_inc_proc_details_by_inc_proc_res(inc_proc_total):
+    """
+    Returns processes + their ids and counts from list of ["IP", [ProcessResponseObjs]] instances
+
+    :param inc_proc_total: List of [IP, [process_inc_time_resObj]] instances of incident ips
+    :return: List of dictionaries of {"proc_name": count, ..., "ids": [proc_id1, ...]} for each processObj
+    in the given list.
+    """
+
+    inc_proc_set = []
+
+    for elem in inc_proc_total:
+        procs = elem[1]
+        all_procs = {}
+        for proc in procs:
+            if proc.aggregations.per_src_process.buckets._l_:
+                for inner_proc in proc.aggregations.per_src_process.buckets._l_:
+                    all_procs[inner_proc["key"]] = inner_proc["doc_count"]
+
+        if all_procs:
+            all_procs["ids"] = []
+
+        for proc_instance in procs:
+            for proc_hit in proc_instance.hits._l_:
+                all_procs["ids"].append(proc_hit.source_process_id)
+
+        inc_proc_set.append(all_procs)
+
+    return inc_proc_set
+
+
+def proc_info_from_proc_set(inc_proc_set, inc_proc_total):
+    """
+    Get process info response objects from process ids dict of form {"proc_name": count, ..., "ids": [proc_id1, ...]}
+
+    :param inc_proc_set: List of dictionaries of {"proc_name": count, ..., "ids": [proc_id1, ...]}
+    :param inc_proc_total: List of possible processes of each if the given incident times in inc_time_list
+    :return: List of lists containing process info objects from the "processes" collection type in Elasticsearch
+    """
+
+    full_proc_info = []
+
+    for ind in range(len(inc_proc_set)):
+        if inc_proc_set[ind]:
+            ids = inc_proc_set[ind]["ids"]
+            res = []
+            for id in ids:
+                res.append(get_process_info(id, inc_proc_total[ind][0]))
+        else:
+            res = []
+        full_proc_info.append(res)
+
+    return full_proc_info
+
+
+def proc_details_from_proc_info(full_proc_info):
+    """
+    Gets process path and hash from process response objects list as received above "full_proc_info"
+
+    :param full_proc_info: List of lists containing process info objects from the "processes" collection
+    type in Elasticsearch as returned by proc_info_from_proc_set()
+    :return: List of set of tuples containing (process_path, process_hash) of the processes info objects
+    """
+
+    full_proc_details = []
+    for procs_coll in full_proc_info:
+        inner_proc_info = set()
+        for proc_res in procs_coll:
+            if hasattr(proc_res.hits._l_[0], "full_path"):
+                inner_proc_info.add((proc_res.hits._l_[0].full_path, proc_res.hits._l_[0].image_hash))
+        full_proc_details.append(inner_proc_info)
+
+    return full_proc_details
+
+
+def ports_and_num_of_incs_from_scan_objects_list(scan_records_list):
+    """
+    Returns 3 lists as follows:
+    scanner_ports - Ports scanned by the object
+    num_of_incs_per_asset - Number of scan incidents related to the object
+    scanner_names - VM name of the object
+
+    :param scan_records_list: List of dictionaries of scanning objects as they appear in the JSON file extracted
+    from Mongo
+
+    :return: scanner_ports, num_of_incs_per_asset, scanner_names
+    """
+
+    scanner_ports = []
+    num_of_incs_per_asset = []
+    scanner_names = []
+
+    for elem in scan_records_list:
+        scanner_ports.append(set(elem["Ports"]))
+        num_of_incs_per_asset.append(elem["incident_ids"])
+        scanner_names.append(elem["vm_name"][0])
+
+    return [scanner_ports, num_of_incs_per_asset, scanner_names]
+
+
+def csv_from_scan_lists(inc_proc_total, inc_proc_set_no_ids, full_proc_details, scanner_ports,
+                        scan_agent, num_of_incs_per_asset):
+    """
+    Outputs scan_details.csv file from the set of lists retrieved from the
+    JSON scanner objects file by the previous functions
+
+    :param inc_proc_total: List of possible processes of each of the given incident times in inc_time_list.
+    :param inc_proc_set_no_ids: Similar to inc_proc_set but with "ids" = [].
+    :param full_proc_details: List of set of tuples (process_path, process_hash) of the processes info objects.
+    :param scanner_ports: List of sets of scanned ports of each scanning object.
+    :param scan_agent: List of Boolean values stating whether an Agent is installed on the scanning asset.
+    :param num_of_incs_per_asset: List of number of incidents related to each asset as it appears in the JSON file.
+    :return: None
+    """
+
+    if not scan_agent:
+        scan_agent = [True] * len(inc_proc_total)
+
+    with open("scan_details.csv", "w") as f:
+        csv_headers = ("Scanner IP,Agent installed,Num of incidents," +
+                       "Possible processes of incidents,Processes details,Ports\n")
+        f.write(csv_headers)
+        for index in range(len(inc_proc_total)):
+            full_proc = '"' + str(inc_proc_set_no_ids[index]) + '"'
+            proc_details = '"' + str(full_proc_details[index]) + '"'
+            scanned_ports = '"' + str(scanner_ports[index]) + '"'
+            temp_str = ",".join([str(inc_proc_total[index][0]), str(scan_agent[index]),
+                                str(num_of_incs_per_asset[index]), full_proc, proc_details,
+                                scanned_ports])
+            f.write(temp_str + "\n")
+
+
 # loop to get process info for a list of scan_object processes as returned by get_processes_by_scan_obj() #
 ###########################################################################################################
 # for elem in all_processes: # all_processes is a list of tuples (src_ip, Response_object for scan incident process)
@@ -523,7 +702,7 @@ def get_process_info(process_id, source_ip):
 #         proc_info_res.append((elem[0], procs))
 
 
-# get processes names frol list ["IP", [ProcessResponseObjs]] #
+# get processes names from list ["IP", [ProcessResponseObjs]] #
 ###############################################################
 # inc_proc_set = []
 # for elem in inc_proc_total:
@@ -550,3 +729,48 @@ def get_process_info(process_id, source_ip):
 #         for proc_hit in proc_instance.hits._l_:
 #             all_procs["ids"].append(proc_hit.source_process_id)
 #     inc_proc_set.append(all_procs)
+
+# output csv file from inc_proc_total #
+#######################################
+# with open("scan_details.csv", "w") as f:
+#     csv_headers = ("Scanner IP,Agent installed,Num of incidents," +
+#                   "Possible processes of first 10 incidents,Processes details,Ports\n")
+#     f.write(csv_headers)
+#     for index in range(len(inc_proc_total)):
+#         temp_proc = str(','.join(inc_proc_set[index]))
+#         full_proc = '"' + temp_proc + '"'  # delete this line if using the one below
+#         full_proc = '"' + str(inc_proc_set_no_ids[index]) + '"'
+#         proc_details = '"' + str(full_proc_details[index]) + '"'
+#         scanned_ports = '"' + str(scanner_ports[index]) + '"'
+#         temp_str = ",".join([str(inc_proc_total[index][0]), str(scan_agent[index]),
+#                             str(num_of_incs_per_asset[index]), full_proc, proc_details,
+#                             scanned_ports])
+#         f.write(temp_str + "\n")
+
+
+# Get process info response objects from process ids dict  #
+# of form {"proc_name": count, ..., "ids": [proc_id1, ...] #
+############################################################
+
+# for ind in range(len(inc_proc_set)):
+#     if inc_proc_set[ind]:
+#         ids = inc_proc_set[ind]["ids"]
+#         res = []
+#         for id in ids:
+#             res.append(get_process_info(id, inc_proc_total[ind][0]))
+#     else:
+#         res = []
+#     full_proc_info.append(res)
+
+# get process path and hash from process response objects list as received above "full_proc_info" #
+###################################################################################################
+
+# full_proc_details = []
+# for procs_coll in full_proc_info:
+#     inner_proc_info = set()
+#     for proc_res in procs_coll:
+#         if hasattr(proc_res.hits._l_[0], "full_path"):
+#             inner_proc_info.add((proc_res.hits._l_[0].full_path, proc_res.hits._l_[0].image_hash))
+#     full_proc_details.append(inner_proc_info)
+
+

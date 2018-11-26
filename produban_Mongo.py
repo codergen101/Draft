@@ -108,26 +108,114 @@ def check_agent_by_vm_name(orch_vm_collection, names):
     return vm_agent
 
 
-def get_vm_by_vm_name_in_range(orch_vm_collection: collection.Collection, names):
+def get_vm_by_vm_name_in_range(orch_vm_collection: collection.Collection, names: List, last_seen: datetime.datetime):
     """
     Checks whether an agent is installed on which one of the VMs with the given names.
+    example of last_seen = datetime.datetime(2018, 10, 1, 00, 00, 00)
 
     :param orch_vm_collection: orchestration_vm collection
     :param names: List of names of VMs to check
-    :return: List containing True if the VM has agent installed on it, otherwise False
+    :param last_seen: Datetime object representing the earliest time for the checked vm to be last seen
+    :return: List of Cursors to records in the orchestration_vm collection that match the given criteria
     """
-
-    # ToDo: implement the time range mechanism
 
     vm_agent = []
 
     for name in names:
         res = orch_vm_collection.find(
             {"name": name,
-             "last_seen": {"$gt": datetime.datetime(2018, 10, 1, 00, 00, 00)}})
+             "last_seen": {"$gt": last_seen}})
         vm_agent.append(res)
 
     return vm_agent
+
+
+def agent_check_from_vm_cursor(vm_agent):
+    """
+    Returns a list containing True if the VM has agent installed on it, otherwise False
+
+    :param vm_agent: List of Cursors to records in the orchestration_vm collection. This is vm_agent
+    as returned by get_vm_by_vm_name_in_range
+
+    :return: List containing True if the VM has agent installed on it, otherwise False
+    """
+
+    scan_agent = []
+
+    for elem in vm_agent:
+        if "guest_agent_details" in elem.next():
+            scan_agent.append(True)
+        else:
+            scan_agent.append(False)
+
+    return scan_agent
+
+
+def get_inc_time_by_inc_id(inc_collection, ip_inc):
+    """
+    Returns a list of tuples (IP, [start_times of incidents]) of the given incident IDs and their IPs.
+
+    :param inc_collection: 'guardicore_incident' collection of MongoDB
+    :param ip_inc: List of tuples (IP, [incident_ids])
+    :return: List of tuples (IP, [start_time of incidents]) of the given IPs and their incident IDs
+    """
+
+    inc_times = []
+
+    for elem in ip_inc:
+        temp_inc_times = []
+        for s_id in elem[0][1]:
+            inc_time = get_record_field_by_field_value(inc_collection, "start_time", ["_id"], [s_id], [False])
+            temp_inc_times.append(inc_time)
+        inc_times.append((elem[0][0], temp_inc_times))
+
+    return inc_times
+
+
+def get_n_incidents_by_ip(ip_addr, scan_objs, n=10, by_ip=False):
+    """
+    Retrieves the ids of the min(n, len(incident_obj["incident_ids"])) of the incident object with the
+    given IP address.
+    scan_objs is a list of dicts of scan objects as queried from mongo.
+
+    :param ip_addr: The IP address of the scan object to look for. pass None if by_ip is False.
+    :param scan_objs: List containing scan objects as retrieved from mongo.
+    :param n: number of incident ids to return for the scan object. Default is 10.
+    :param by_ip: When True, will return the incident ids only for the objects with the given IP.
+                  When False, will return the incident ids for all the objects in the given list.
+    :return: Incident IDs of min(n, len(scan_obj["incident_ids"]))
+    """
+
+    ip_inc = []
+
+    for elem in scan_objs:
+        if by_ip:
+            if elem["IP"] == ip_addr:
+                return tuple((elem["IP"], elem["incident_ids"][:min(n, len(elem["incident_ids"]))]))
+        else:
+            ip_inc.append((elem["IP"], elem["incident_ids"][:min(n, len(elem["incident_ids"]))]))
+
+    return ip_inc
+
+
+def get_n_incidents_by_ip_list(ip_list, scan_objs, n=10):
+    """
+    Retrieves the ids of the min(n, len(incident_obj["incident_ids"])) of the incident object which
+    have IP addresses from the given list.
+    scan_objs is a list of dicts of scan objects as queried from mongo.
+
+    :param ip_list: List of IP addresses to search by
+    :param scan_objs: List containing scan objects as retrieved from mongo.
+    :param n: number of incident ids to return for the scan object. Default is 10.
+    :return: List of tuples (IP, incident_ids_list) for each IP in the given list
+    """
+
+    ip_inc = []
+
+    for ip in ip_list:
+        ip_inc.append(get_n_incidents_by_ip(ip, scan_objs, n, True))
+
+    return ip_inc
 
 
 # Auxiliary helpers #
